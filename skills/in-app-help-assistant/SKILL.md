@@ -1,6 +1,6 @@
 ---
 name: in-app-help-assistant
-description: Build an in-app help assistant for a web app - a panel on every screen that answers "how do I…?" with the app's exact labels, shows close-up screenshots that point at the button to press, links to the screens the user can open, and (optionally) reads the user's own data and prepares actions without executing them. Use when adding a help/support assistant or copilot to an existing product, when an existing agent must learn how the app's UI works, or when porting this pattern to another repo.
+description: Build an in-app help assistant for a web app - a panel on every screen that answers "how do I…?" with the app's exact labels, shows close-up screenshots that point at the button to press, links to the screens the user can open, and (optionally) reads the user's own data and prepares actions without executing them. Use when adding a help/support assistant or copilot to an existing product, when an existing agent must learn how the app's UI works, or when porting this pattern to another repo. Also covers keeping it cheap: prompt caching, model and provider-route choice, and a per-call AI cost ledger with reconciliation.
 ---
 
 # In-app help assistant
@@ -19,7 +19,9 @@ This pattern has been built three times:
   clickable zones, 12 permission-scoped data tools, action buttons and a 32-case eval. It took one
   day plus fixes.
 - **An existing multi-agent product** (an education platform's admin panel, with 90+ pages), where
-  it was ported into the agent runtime the product already had.
+  it was ported into the agent runtime the product already had. This one went furthest on cost:
+  44 manual sections, 54 screenshots, "Explain this" buttons, four prepared actions, a 40-case eval
+  and a per-call cost ledger. Its model tokens cost well under a tenth of a cent per question.
 
 `reference.md` has the code for every piece. Capturing screenshots uses the `agent-app-screenshots`
 skill (`npx skills add https://github.com/samuelferfort/agent-skills --skill agent-app-screenshots`)
@@ -50,12 +52,31 @@ Ask the user only what the code can't tell you.
 
    The manual alone already answers most questions. Action buttons cost the most, because every
    target dialog must open from a URL.
-4. **Model and route.** Use a fast model with low reasoning. **Measure time-to-first-token on the
-   real provider route before committing.** In one build, Gemini through Vertex took 68–203 s to the
-   first token and the same model through Google AI Studio took 1.6–5.6 s. Pin one provider so
-   implicit prefix caching hits.
+4. **Model and route.** Use a small, fast model with low reasoning. Picking a section and writing
+   steps needs no long thinking, and reasoning tokens are billed as output.
+   - **Measure time-to-first-token on the real provider route before committing.** In one build,
+     Gemini through Vertex took 68–203 s to the first token, while the same model through Google AI
+     Studio took 1.6–5.6 s.
+   - **Run the eval on two or three candidate models and compare pass rate and cost per run** before
+     choosing (§6). In one build, the newer, cheaper model of the same family passed 39/40, the
+     same as the older one, at a third of the cost.
+   - **Pin the provider route** in the gateway (`order` and `only`). Implicit prefix caching only
+     hits when the same provider serves every call. Some routes also add a per-request surcharge,
+     keep no zero-retention promise or answer slower, and a gateway that falls back freely will
+     land on them. Check the gateway's per-call record for which provider answered.
+   - **Structured output on OpenAI.** The provider asks for strict JSON schemas by default, and
+     strict mode rejects optional fields. A router whose schema has an optional field then fails
+     with a 400 error, but only on the calls the gateway sends to OpenAI. Set
+     `strictJsonSchema: false`, or make every field required.
 5. **Demo data.** Screenshots and the eval need a seeded database with one demo user per role.
-   Never use production. Personal data that shows up anyway must be redacted.
+   Never use production. Personal data that shows up anyway must be redacted. Some screens only
+   make sense with states that are hard to seed (a real submission, real prices, a live session).
+   For those, take the screenshots from an anonymized copy of production (§3).
+6. **Environments in the cost data.** Record the environment in every cost-ledger row (§5b), not as a
+   gateway tag. Local evals and
+   end-to-end runs with real models cost real money: in one build, a "this is too expensive" alarm
+   turned out to be 98% local test runs on a pricier model, with production at $0.07. Use the
+   production model, or a cheaper one, in local `.env` files.
 
 ## 1. The manual: small, curated, in the repo
 
@@ -71,8 +92,13 @@ Ask the user only what the code can't tell you.
   - Common problems
 - **Exact labels.** Write UI labels exactly as rendered, in «» or quotes. Read them from the
   components or the i18n files, never from memory.
-- **No RAG while the corpus fits an index (about 40 sections or fewer).**
-  - Put the index (one line per section: id, title, routes, summary) in the prompt.
+- **No RAG while the corpus fits an index (about 50 sections or fewer).**
+  - Put the index (one line per section: id, title and summary) in the prompt. Leave routes out:
+    the server already uses them for the current-screen hint, and the model doesn't need them to
+    choose.
+  - Write summaries as the words people use when they ask ("refund, cancel, unpaid, card
+    declined"), not as prose. In one build this halved the index, which every turn pays for,
+    with the same eval result.
   - The model fetches up to 3 sections with a tool whose input is `z.enum(sectionIds)`, so it cannot
     invent a section.
   - Choosing by title and summary beats chunk retrieval at this size, and there is no index to keep
@@ -83,6 +109,13 @@ Ask the user only what the code can't tell you.
   coverage test must fail when a screen ships without its section.
 - **Hint the current screen.** Map `pathname` to sections (most specific route first) and name the
   top 1–2 in the prompt ("if they ask about 'this', start here").
+- **Close sections in code, not only in the prompt.** When the asker can't open the screen a section
+  explains, the tool returns that section closed: no steps, no screenshots, only "their role can't
+  open this, tell them who grants access". A prompt rule alone leaks. Cheaper models in particular
+  walk a role through a screen it doesn't have when the steps are right there in the tool result.
+  Decide "can open" with the same rule the client uses for links: one of the section's routes is one
+  of the asker's screens, or a page under one. Sections with no screen of their own (navigation,
+  home) stay open for everyone.
 
 ## 2. Prompt layout (cache-friendly)
 
@@ -90,9 +123,31 @@ Ask the user only what the code can't tell you.
 [FIXED — identical for everyone, goes first so the provider caches it]
   role and scope · how to answer usage questions · screenshot rules · action rules · data rules · limits
 [Manual index]                        stable between deploys
+---------------- conversation history ----------------
 [Who is asking]                       name, role, modules they can and can't see, today's date, current screen
 [Screens they can open]               from the same function that builds their nav menu, byte-stable per permission set
+[Preloaded section]                   only on "Explain this" turns (§4b)
 ```
+
+**Caching is the main cost lever.** Providers cache the longest identical prefix of the prompt,
+so what changes per person or per screen must come after everything that doesn't:
+
+- **Fixed part before the history.** Put the rules and the index in the agent's `instructions`
+  (the system message before the history). Send the per-asker part as a system message after the
+  history. If the asker block sits inside the instructions, the prefix breaks at the asker's name
+  and every turn of every person pays for the whole prompt again.
+- **Make the prefix long enough.** OpenAI caches only prompts of 1,024 tokens or more, in
+  128-token steps. A short task (a router, a synthesis step) whose fixed guidance is under that
+  size never caches. Put all the stable guidance first and the per-turn document last. In one
+  build, putting a synthesis step's guidance (about 1,200 tokens) before the document made each
+  question read 1,184 tokens from cache, where before it read none.
+- **Pin a cache key.** With OpenAI, pass one `promptCacheKey` per feature (for example
+  `providerOptions: { openai: { promptCacheKey: "app-help" } }`), so every turn of that feature
+  lands on the same cache. Keep providers pinned (§0) for the same reason.
+- **Keep the variable blocks byte-stable.** List screens in a fixed order. Write today's date and
+  not the time. Don't add request ids or timestamps to the prompt.
+- **Check it in the log.** Record `cachedInputTokens` per call (§5b). A feature with 0 cached
+  tokens on its second turn has a broken prefix.
 
 Rules that turned out to matter:
 
@@ -145,7 +200,27 @@ the contact-sheet review. The mature build added the following.
     load.
   - Draw the cursor and click animation in an overlay, using percentages of the image.
   - With reduced motion, show the final state only.
+  - If the product has a motion budget (for example 200 ms or less in the app), it wins. Use a
+    static outline on the zone with a short fade, and crop around the zone (at least 360 × 200)
+    instead of animating a cursor.
+  - Images never overflow the panel: `max-width: 100%`, the height from the aspect ratio, and the
+    full image in the zoom dialog.
 - **Images in the repo** (`public/…`), served by the app's own CDN with content hashes.
+- **Screens the demo data can't show.** Some screens need states that are hard to seed, like a
+  real submission being corrected, real price tables or a live session console. Take those shots
+  from a **disposable, anonymized copy of production**, never from production itself:
+  1. Branch the production database (Neon, PlanetScale or a snapshot restore) under a name that
+     marks it as a capture copy, for example `captures-prod-YYYYMMDD`.
+  2. Run an anonymization script that refuses any database not named like that. It replaces names,
+     emails, phones, addresses, messages, notes, orders and user-written answers with made-up data,
+     deletes every session, moves payment scopes to test mode and sets the shared test account's
+     password to the fixtures' test password.
+  3. Start the app against the copy with fake keys for every third-party service (payments, video,
+     email), so nothing can be charged or sent.
+  4. Capture only the shots that need it, and review every image for real data before committing.
+     Extend the redaction list whenever a real name slips through, for example the "Name: " prefix
+     in chat previews.
+  5. Delete the copy the same day.
 
 ## 4. Links, data and actions
 
@@ -184,8 +259,16 @@ across screens (for example, restock what is missing).
 - **Keep it in code.** Prompts live in a typed registry (`id → { label, prompt, screen }`), not as
   inline strings. Each entry has an eval case, and each turn logs the `entry` id so you can see
   which buttons get used.
+- **Preload the section.** The client sends the entry id, never the prompt, and the server looks up
+  the button's screen. It finds that screen's main manual section, and only if the asker can open it
+  appends it after the history as if the tool had returned it. It also writes a transient data part
+  (`data-app-manual-preloaded`) so the panel still shows the "read the manual" step. That turn then
+  answers in its first step, with at most one extra section, and has no action tool, because an
+  "explain" button never asks to do anything. Without the preloaded section, the first call exists
+  only to pick a section, and it is a full-context call billed like the answer.
 - **Use few of them.** One per confusing spot. A button on every card is noise.
 
+## 5. Route, turns and log
 
 - **Request body.** The client sends only the new message, plus `pathname` and page title. The
   server validates the pathname (internal routes only) and trims the title.
@@ -201,9 +284,66 @@ across screens (for example, restock what is missing).
   new conversation and the old one stays in history.
 - **Tool steps.** Show each tool as a step with a past-tense result ("1 manual section", "3 tasks"),
   collapsed once the answer starts. Do not claim a query is "heavy" from elapsed time alone.
+- **Few steps, each with its own instruction.** Every step resends the whole prompt, so cap a
+  help turn at 3 steps: pick sections, at most one more section, answer. Give each step a short
+  instruction ("call the manual first", "you have the sections, answer now", "answer without
+  tools"), and on the last step remove the tools. A loose `maxSteps: 8` lets cheap models loop on
+  the manual tool.
+- **Idle timeout as well as the hard one.** Cut the turn when no data has arrived for about 30–45 s,
+  so a provider outage doesn't leave the panel stuck on "Reading the manual…". Give the router its
+  own short timeout (about 8 s) with a safe fallback branch.
 
-Reference numbers from the mature build: about 11.7k input tokens and 260 output tokens per question, about
-€0.01 per question, 7.7 s median.
+Reference numbers:
+
+- ERP build on Gemini Flash: about 11.7k input tokens and 260 output tokens per question, about
+  €0.01 per question, 7.7 s median.
+- Ported build on a small reasoning model with low effort, caching and the trimmed index: 39/40 in
+  the eval, about $0.014 for the whole 40-case run.
+
+## 5b. Cost: a ledger per call, not only per turn
+
+A per-turn total says that a turn was expensive. It doesn't say why. Log **every paid call**
+(generation, embedding, rerank, transcription, OCR) as its own row, linked to the turn:
+
+- **Row.** `feature` (what the spend is for), `operation` (the step: `router`, `query-embedding`,
+  `rerank`, `synthesis`, `agent.stream`…), `turn_id`, actor, `route` (gateway, direct), `model`,
+  input, cached input and output tokens, `units` for metered calls (rerank search units, audio
+  seconds), an estimated cost from a versioned price table, the provider request id, `metadata`
+  (environment, entry point) and the time.
+- **Ambient scope.** Whoever starts the work (the turn, an upload, a worker) opens a scope with
+  feature, turn and actor in `AsyncLocalStorage`. Every adapter that calls a model reports into it,
+  so nothing is passed by parameter. Calls outside a scope are still recorded as "unclassified", so
+  no spend goes missing.
+- **Reconcile with the real bill.** A job looks up each call's generation in the gateway (for
+  Vercel AI Gateway, `GET /v1/generation?id=…`). After a couple of minutes of settling, it stores the
+  real cost next to the estimate, with what the gateway billed: its token counts, cache reads and
+  writes, and any `surcharge_cost`. With your own provider keys (BYOK), the real cost is the
+  upstream cost. Keeping the billed breakdown is what lets you explain a gap call by call.
+- **Dashboard.** Show spend by feature and by model, then the breakdown that finds problems:
+  - by step;
+  - average cost per answer, with all of its calls;
+  - cache hit rate (cached ÷ input tokens);
+  - the most expensive answers, by `turn_id`, which open into their steps and models.
+
+  Show figures only, never the question text. Add year and date-range filters.
+
+Hidden costs found this way:
+
+- **Gateway tags are billed.** Vercel AI Gateway's custom reporting charges per tag ($0.075 per
+  1,000 tags). Three tags on every call came to $0.000225 per call, more than a cheap model's
+  router call. Tag only eval runs. Use the ledger's `feature` and `operation` for production
+  reporting.
+- **Fixed per-search fees dominate once the model is cheap.** A rerank call billed per search unit
+  ($0.002) cost five times the router and the answer together. Cache rerank results for about 15
+  minutes by query and candidate set. Compare rerank providers on your own corpus, and recalibrate
+  the relevance threshold before switching, because scores differ between providers.
+- **Surcharged provider routes.** A free gateway fallback can land on a route with a per-request
+  surcharge (§0). Look for `surcharge_cost > 0` in the reconciled rows.
+- **Reasoning tokens.** Reasoning models bill their thinking as output. Set the effort to low for
+  routers, help and synthesis, and check output tokens per step.
+- **Two calls where one would do.** A structured step that first wrote free text and then parsed it
+  with a second call was merged into one call with a strict schema, which was faster too (9 s
+  instead of 15 s).
 
 ## 6. Tests and eval: protect the content, measure the model
 
@@ -224,6 +364,10 @@ Deterministic tests (vitest, no model calls):
 - **Roles.** Each role gets only the tools of its modules, and the screen list contains only what
   its menu shows.
 - **Actions.** Each action targets a real page and its prefill passes its schema.
+- **Closed sections.** For a role without a screen, the tool returns that screen's section closed:
+  no steps and no screenshot ids.
+- **Prompt layout.** The fixed part is identical for two different askers on two different screens,
+  so the cache prefix holds. The asker's name doesn't appear in it.
 
 Eval (`scripts/eval.mjs`): run against the real agent on demo data, with 25–35 real questions per
 role. Assert per case:
@@ -235,7 +379,25 @@ role. Assert per case:
 - the expected action and its data;
 - no claims to have done something, and no data outside the role.
 
-Run the eval before and after every change to the prompt, model or tools.
+Also record latency and, from the cost ledger, the run's cost and cache hit rate, and write a
+report per run. Add one case per "Explain this" entry point. Run the eval before and after every
+change to the prompt, model or tools, and on every candidate model (§0).
+
+**Router regression set.** If turns are routed (conversational, knowledge, app help), keep a
+separate set of 40–50 labelled questions just for the router, and run it on every candidate
+model. Cheap models fail at the borders, so include the near misses:
+
+- "what was my previous question?" is conversational and is answered from history;
+- "and what was that code again?" asks again for data from a source, so it is knowledge;
+- "what can you do?" is app help, not conversational;
+- "practice exam" is the app's feature, not a topic in the corpus.
+
+**End-to-end tests** (Playwright) on the panel: open it from the shortcut and the command menu,
+ask a how-to question, see a screenshot and a link, follow the link with the panel still open,
+use "Explain this", and reopen the history. Run them against a production build
+(`build && start`), because dev mode compiles routes on demand and the tests time out. Use a
+disposable database branch. Keep locators scoped to the panel, because the page behind it has
+the same words.
 
 ## 7. Keeping it alive
 
@@ -243,8 +405,11 @@ Run the eval before and after every change to the prompt, model or tools.
 | --- | --- |
 | A screen changes | Update its section in the same commit and re-run its capture script |
 | A screen is born | Add its route to a section (the coverage test fails otherwise) |
-| Prompt, model or tools change | Run the eval before and after |
+| Prompt, model or tools change | Run the eval (and the router set) before and after |
 | A provider is slow | Measure TTFT per provider route before touching the prompt |
+| Spend looks high | Split by environment first, then by step and by most expensive answer (§5b) |
+| A new model comes out | Run the eval and the router set on it, and compare pass rate and cost per run |
+| A screen needs real data for its shot | Use an anonymized production copy and delete it the same day (§3) |
 
 ## Lessons from porting into an existing agent stack
 
@@ -277,16 +442,35 @@ Run the eval before and after every change to the prompt, model or tools.
 - **Reuse the shared markdown.** Add a `components` override for links rather than forking it.
   Check that existing chat bubbles' copy and retry buttons actually have handlers: in one port the old
   ones didn't.
+- **Panel layout.** Dock the panel beside the content instead of floating it over the content
+  (one build docks it on the left, next to the navigation). Let it collapse to a narrow rail, and
+  make it full screen on phones. With the panel open, the content area shrinks.
+  Make dense screens respond to their own width (container queries), not the viewport's, or
+  their tables and toolbars break while the panel is open.
+- **One entry button near the top.** An "Ask <Assistant>" row at the top of the navigation beats an
+  icon at the bottom of the rail. Add a keyboard shortcut and a command-menu entry as well.
+- **Composer.** It grows with the text up to a few lines. Enter sends and Shift+Enter adds a line.
 
 ## Porting checklist
 
-- [ ] Decisions from §0 written down, including a TTFT measurement of the chosen model and route
-- [ ] Manual loader, index, `consult_manual` tool, coverage test
-- [ ] Prompt with a fixed head and a variable tail; "who is asking" from the real session and permissions
-- [ ] Panel on every screen (shortcut and command menu), only the new message sent, pathname and title
+- [ ] Decisions from §0 written down: TTFT, eval pass rate and cost per run of the candidate models,
+      and the pinned provider route
+- [ ] Manual loader, keyword index without routes, `consult_manual` tool, coverage test
+- [ ] Sections closed in the tool for screens the asker can't open
+- [ ] Prompt with the fixed part before the history and the asker after it, a cache key, and a prefix over
+      the provider's caching minimum
+- [ ] "Who is asking" from the real session and permissions
+- [ ] Panel on every screen (top entry, shortcut and command menu), docked, container-query-safe
+      screens, only the new message sent, pathname and title
 - [ ] Screen list from the nav function, plus client-side link guard
-- [ ] Capture scripts per area, catalog, marker parser, `<Captura>` with zones
-- [ ] Turn log, rate limit, timeout with retry, server-side completion
-- [ ] Eval with per-role cases; numbers recorded in the doc
-- [ ] Data tools and actions only after the above is stable
+- [ ] Capture scripts per area, catalog, marker parser, `<Captura>` with zones; anonymized-copy procedure
+      for screens demo data can't show
+- [ ] Turn log, per-call cost ledger with reconciliation, rate limit, idle and hard timeouts with
+      retry, server-side completion
+- [ ] Cost dashboard with steps, cost per answer, cache rate and most expensive answers; no gateway tags
+      on production calls
+- [ ] Eval with per-role cases, router regression set, Playwright e2e on a production build; numbers
+      recorded in the doc
+- [ ] "Explain this" entry points with the preloaded section; data tools and actions only after the above
+      is stable
 - [ ] A maintenance doc in the repo (the table in §7)
