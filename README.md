@@ -15,3 +15,7 @@ npx skills add https://github.com/LienzzoDev/agent-skills --skill in-app-help-as
 It works well together with
 [`agent-app-screenshots`](https://github.com/samuelferfort/agent-skills), which covers capturing
 and redacting the screenshots.
+
+## License
+
+[MIT](LICENSE).
