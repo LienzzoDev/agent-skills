@@ -43,8 +43,8 @@ let cached: Section[] | null = null;
 export const sections = () => (process.env.NODE_ENV !== "production" ? load() : (cached ??= load()));
 export const sectionIds = () => sections().map((s) => s.id) as [string, ...string[]];
 
-export const manualIndex = () =>
-  sections().map((s) => `- \`${s.id}\` — ${s.title}${s.routes.length ? ` (${s.routes.join(", ")})` : ""}: ${s.summary}`).join("\n");
+/** One line per section. No routes: the server uses them for the screen hint, the model chooses by words */
+export const manualIndex = () => sections().map((s) => `- \`${s.id}\` — ${s.title}: ${s.summary}`).join("\n");
 
 const routeRegex = (route: string) =>
   new RegExp(`^${route.split("/").map((seg) => (/^\[.+\]$/.test(seg) ? "[^/]+" : seg.replace(/[.*+?^${}()|\\]/g, "\\$&"))).join("/")}/?$`);
@@ -82,7 +82,22 @@ export function renderSection(s: Section): string {
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
 
-export function consultManualTool() {
+/**
+ * Whether the asker can open the screen a section explains: one of its routes is one of their
+ * screens or a page under it (the same rule the client uses for links). Sections without a
+ * screen of their own (navigation, home) are for everyone.
+ */
+export function isSectionOpen(s: Section, screens: readonly Screen[]) {
+  const routes = s.routes.map((r) => r.split("/[")[0]).filter((r) => r !== "/");
+  if (!routes.length) return true;
+  return routes.some((r) => screens.some((sc) => sc.route !== "/" && (r === sc.route || r.startsWith(`${sc.route}/`))));
+}
+
+/** No steps and no screenshots: a prompt rule alone leaks, a closed section can't */
+const closedSection = (s: Section) =>
+  `<section id="${s.id}" access="no">\n«${s.title}» is not in this person's menu: their role can't open that screen. Don't explain its steps, link it or show screenshots; tell them they don't have access and who grants it.\n</section>`;
+
+export function consultManualTool(screens?: readonly Screen[]) {
   return createTool({
     id: "consult_manual",
     description:
@@ -93,7 +108,8 @@ export function consultManualTool() {
     outputSchema: z.object({ content: z.string() }),
     execute: async ({ sections: wanted }) => {
       const all = sections();
-      return { content: [...new Set(wanted)].flatMap((id) => all.filter((s) => s.id === id)).map(renderSection).join("\n\n") };
+      const render = (s: Section) => (!screens || isSectionOpen(s, screens) ? renderSection(s) : closedSection(s));
+      return { content: [...new Set(wanted)].flatMap((id) => all.filter((s) => s.id === id)).map(render).join("\n\n") };
     },
   });
 }
@@ -101,26 +117,81 @@ export function consultManualTool() {
 
 (Mastra 1.x: `execute` receives the input object directly. On older versions it is `({ context })`.)
 
-## Instructions
+## Step flow
+
+Each step gets its own instruction, and the last one loses its tools. With Mastra this is an
+input processor (`processInputStep`) that sets `toolChoice`, `activeTools` and one extra system
+line per step. With plain AI SDK, use `prepareStep`.
 
 ```ts
-export function buildInstructions(asking: Asking): string {
+const FIRST = "First call consult_manual with the index sections that cover the question. A greeting or 'what can you do?' is answered directly, without tools.";
+const FOLLOW_UP = "You have manual sections. If an essential one is missing, ask for it; otherwise answer now with the steps and the exact labels.";
+const FINAL = "Answer now without tools, only with what the manual says. If it doesn't cover it, say so plainly.";
+const PRELOADED = "The manual section of the screen they ask about is already in your instructions under «Section already read». Answer with it now; call consult_manual only if another essential section is missing.";
+
+// AI SDK: generateText/streamText({ ..., stopWhen: stepCountIs(max), prepareStep }).
+// The step line goes LAST, as a system message after the conversation: putting it in `system`
+// would replace the system prompt and move the cache boundary every step.
+export const helpSteps = ({ preloaded }: { preloaded: boolean }) => {
+  const max = preloaded ? 2 : 3;
+  const line = (stepNumber: number) =>
+    stepNumber >= max - 1 ? FINAL : preloaded ? PRELOADED : stepNumber === 0 ? FIRST : FOLLOW_UP;
+  return {
+    max,
+    prepareStep: ({ stepNumber, messages }: { stepNumber: number; messages: ModelMessage[] }) => ({
+      activeTools: stepNumber >= max - 1 ? [] : preloaded ? ["consult_manual"] : ["consult_manual", "prepare_action"], // explain buttons never prepare actions
+      messages: [...messages, { role: "system" as const, content: line(stepNumber) }],
+    }),
+  };
+};
+```
+
+## "Explain this" with the section preloaded
+
+```ts
+// Typed registry: the client sends the id, never the prompt
+export const ENTRY_POINTS = {
+  "costs-spend": { label: "Explain this", screen: "/settings/ai-costs", prompt: "Explain the «Spend» card on this screen" },
+} as const;
+
+// In the route handler
+const entry = isEntryPointId(body.entry) ? ENTRY_POINTS[body.entry] : null;
+const [main] = entry ? sectionsForRoute(entry.screen) : [];
+const preloaded = main && isSectionOpen(main, screens) ? main : null;
+if (preloaded) writer.write({ type: "data-app-manual-preloaded", transient: true, data: { sections: [preloaded.id] } });
+if (entry) updateUsageScope({ entryPoint: body.entry });   // §5b: measure which buttons get used
+// …then append `# Section already read\n${renderSection(preloaded)}` after the asker block
+```
+
+## Instructions
+
+Two functions, because the two parts go to different places in the prompt:
+
+```ts
+/** Identical for every person and screen: goes in the agent's `instructions`, before the history */
+export const fixedInstructions = () => `${FIXED}
+
+# Manual index
+${manualIndex()}`;
+
+/** Changes per asker and screen: sent as a system message after the history */
+export function askerInstructions(asking: Asking): string {
   const here = sectionsForRoute(asking.pathname).slice(0, 2);
   const hint = here.length
     ? `\nManual sections covering the screen they are on: ${here.map((s) => `\`${s.id}\``).join(", ")}. If they ask about "this" or "here", start with them.`
     : "";
-  return `${FIXED}
-
-# Manual index
-${manualIndex()}
-
-# Who is asking
+  return `# Who is asking
 ${describeAsking(asking)}${hint}
 
 # Screens they can open
-${screens(asking).map((p) => `- ${p.name}: ${p.route}`).join("\n")}`;
+${screens(asking).map((p) => `- ${p.name}: ${p.route}`).join("\n") || "- None"}`;
 }
 ```
+
+With Mastra, `agent.stream(messages, { instructions: fixedInstructions(), system: askerInstructions(a) })`
+places `instructions` before the remembered history and `system` after it. With plain AI SDK, build
+`messages` as `[{ role: "system", content: fixed }, ...history, { role: "system", content: asker }, newUserMessage]`.
+Check the order once in a raw request log: the cache depends on it.
 
 Sections of `FIXED`, in order. Write them in the product's language.
 
@@ -206,6 +277,49 @@ export const helpAgent = new Agent({
 
 If the repo already has a shared agent runtime (a factory, turn budget, cancellation, memory
 window), plug the manual tool into it instead of copying this one.
+
+## Model: low effort, pinned route, lenient schemas
+
+Wrap the model once, so every agent and every structured call gets the same settings:
+
+```ts
+import { defaultSettingsMiddleware, gateway, wrapLanguageModel } from "ai";
+
+/** Providers that serve this model without surcharge, in order. Check the gateway's record of who answered. */
+const OPENAI_ROUTE = { order: ["openai", "azure"], only: ["openai", "azure"] };
+
+export function assistantModel(id = process.env.ASSISTANT_MODEL ?? "openai/<small-reasoning-model>") {
+  const model = gateway(id);
+  if (id.startsWith("openai/")) {
+    return wrapLanguageModel({
+      model,
+      middleware: defaultSettingsMiddleware({
+        settings: {
+          providerOptions: {
+            // strict JSON schemas reject optional fields: structured calls 400 only when routed to OpenAI
+            openai: { reasoningEffort: "low", strictJsonSchema: false },
+            gateway: OPENAI_ROUTE,
+          },
+        },
+      }),
+    });
+  }
+  if (id.startsWith("google/")) {
+    return wrapLanguageModel({
+      model,
+      middleware: defaultSettingsMiddleware({
+        settings: { providerOptions: { google: { thinkingConfig: { thinkingLevel: "low" } }, gateway: { order: ["google", "vertex"] } } },
+      }),
+    });
+  }
+  return model;
+}
+
+// Per call, on the help turns only:
+const providerOptions = { openai: { promptCacheKey: "app-help" } };
+```
+
+Don't pass gateway `tags` on production calls: they are billed per tag (§5b).
 
 ## Route handler (stream, server-side completion, timeout)
 
@@ -342,3 +456,121 @@ explicit `EXCLUDED` list with a reason. Do not loosen the matcher.
 The runner signs in as the demo user for the role, posts the question with `pathname`, parses the
 UI stream (text, tool calls and their inputs, action parts) and checks every assertion. It exits 1
 on any failure, and every case is a real model call.
+
+## Cost ledger (one row per paid call)
+
+```ts
+export const aiUsageEvents = pgTable("ai_usage_events", {
+  id: bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
+  feature: text("feature").notNull(),          // what the spend is for: "app_help", "knowledge", "grader"…
+  kind: text("kind").notNull(),                // generation | embedding | rerank | transcription | ocr
+  operation: text("operation").notNull(),      // the step: "router", "query-embedding", "rerank", "synthesis"…
+  turnId: uuid("turn_id"),                     // links the calls of one answer
+  actorId: text("actor_id"),
+  route: text("route").notNull(),              // gateway | direct
+  model: text("model").notNull(),              // canonical provider/model
+  inputTokens: integer("input_tokens"),
+  cachedInputTokens: integer("cached_input_tokens"),
+  outputTokens: integer("output_tokens"),
+  units: numeric("units", { precision: 14, scale: 3, mode: "number" }), // search units, audio seconds
+  estimatedCostMicroCents: bigint("estimated_cost_micro_cents", { mode: "number" }), // from a versioned price table
+  pricingVersion: text("pricing_version"),
+  providerRequestId: text("provider_request_id"),
+  reconciledCostMicroCents: bigint("reconciled_cost_micro_cents", { mode: "number" }),
+  reconciledAt: timestamp("reconciled_at", { withTimezone: true }),
+  metadata: jsonb("metadata").$type<Record<string, unknown>>(), // env, entryPoint, gateway.billed…
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [index().on(t.occurredAt), index().on(t.feature, t.occurredAt), index().on(t.turnId), index().on(t.reconciledAt, t.occurredAt)]);
+```
+
+Ambient scope, so adapters report without parameters:
+
+```ts
+const scope = new AsyncLocalStorage<UsageScope>();
+export const withUsageScope = <T>(s: UsageScope, fn: () => Promise<T>) => scope.run({ ...s }, fn);
+export const updateUsageScope = (patch: Partial<UsageScope>) => Object.assign(scope.getStore() ?? {}, patch);
+
+export async function recordAiUsage(e: UsageEntry) {
+  const s = scope.getStore();
+  const model = canonicalModel(e.model ?? s?.model ?? "unknown");
+  await insertUsage({
+    feature: e.feature ?? s?.feature ?? "unclassified", operation: e.operation, kind: e.kind, turnId: s?.turnId ?? null,
+    model, inputTokens: e.inputTokens, cachedInputTokens: e.cachedInputTokens, outputTokens: e.outputTokens, units: e.units,
+    estimatedCostMicroCents: estimateCost(model, e), pricingVersion: PRICING_VERSION, providerRequestId: e.providerRequestId,
+    metadata: { env: process.env.VERCEL_ENV ?? "local", ...(s?.entryPoint ? { entryPoint: s.entryPoint } : {}), ...e.metadata },
+  }).catch(() => {}); // the ledger never breaks an answer
+}
+// AI SDK 6: per step (onStepFinish), usage.inputTokens, usage.inputTokenDetails.cacheReadTokens
+// (cachedInputTokens is deprecated), usage.outputTokens, and providerMetadata.gateway.generationId
+// as providerRequestId: it is the id the reconciliation looks up.
+```
+
+Reconciliation job (cron every few minutes):
+
+```ts
+const BILLED = /^(native_tokens_|tokens_)|^surcharge_cost$/;
+export async function lookupGeneration(id: string, apiKey: string) {
+  const r = await fetch(`https://ai-gateway.vercel.sh/v1/generation?id=${encodeURIComponent(id)}`, {
+    headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(10_000),
+  });
+  if (r.status === 404) return null;            // not published yet: retry on the next run
+  if (!r.ok) throw new Error(`generation lookup ${r.status}`);
+  const d = ((await r.json()) as { data?: Record<string, unknown> }).data ?? {};
+  const usd = (v: unknown) => Number(v) || 0;
+  const byok = d.is_byok === true;
+  return {
+    costMicroCents: Math.round((byok ? usd(d.upstream_inference_cost) + usd(d.total_cost) : usd(d.total_cost)) * 1e8),
+    provider: typeof d.provider_name === "string" ? d.provider_name : null,
+    billed: Object.fromEntries(Object.entries(d).filter(([k, v]) => BILLED.test(k) && typeof v === "number")),
+  };
+}
+// pending = rows with providerRequestId, reconciledAt null, occurredAt between now-7d and now-2min
+```
+
+Dashboard queries (Postgres):
+
+```sql
+-- by step
+select feature, operation, model, count(*) calls, sum(coalesce(reconciled_cost_micro_cents, estimated_cost_micro_cents)) cost,
+       sum(cached_input_tokens)::float / nullif(sum(input_tokens), 0) cache_rate
+from ai_usage_events where occurred_at >= $1 and occurred_at < $2 group by 1, 2, 3 order by cost desc;
+
+-- cost per answer and most expensive answers
+select turn_id, feature, min(occurred_at) at, count(*) calls,
+       sum(coalesce(reconciled_cost_micro_cents, estimated_cost_micro_cents)) cost
+from ai_usage_events where turn_id is not null and occurred_at >= $1 and occurred_at < $2
+group by 1, 2 order by cost desc limit 20;   -- avg(cost) over this set is the cost per answer
+
+-- surcharges and environments
+select metadata->>'env' env, count(*) filter (where (metadata->'gateway'->'billed'->>'surcharge_cost')::numeric > 0) surcharged,
+       sum(coalesce(reconciled_cost_micro_cents, estimated_cost_micro_cents)) cost
+from ai_usage_events where occurred_at >= $1 group by 1;
+```
+
+## Anonymized production copy (for screenshots)
+
+```js
+// node scripts/anonymize-capture-copy.mjs <file with the copy's connection string> captures-prod-YYYYMMDD
+import { neon } from "@neondatabase/serverless";
+import fs from "node:fs";
+const [urlFile, branch] = process.argv.slice(2);
+if (!/^captures-prod-\d{8}$/.test(branch ?? "")) throw new Error("Only runs on a captures-prod-YYYYMMDD copy");
+const sql = neon(fs.readFileSync(urlFile, "utf8").trim());
+const KEEP = "'admin@demo.test'"; // the fixture account you sign in with
+const steps = [
+  `update users set name='Demo user '||id, email='user'||id||'@demo.test', phone=null, image=null where email<>${KEEP}`,
+  `update contacts set name='Contact '||id, email='contact'||id||'@demo.test', phone='+10000'||lpad(id::text,6,'0')`,
+  `update messages set body='Example message' where body is not null`,
+  `update notes set body='Example note'`,
+  `update orders set name='Demo customer', email='order'||id||'@demo.test', address=null`,
+  `update submissions set answer='Example answer' where answer is not null`,
+  `delete from sessions`,
+  `update payment_accounts set scope='test' where scope='live'`,
+  // …one line per table that holds personal or user-written data: walk the schema, don't trust memory
+];
+for (const q of steps) await sql.query(q);
+// Then copy the fixture account's TEST password hash from the e2e database, never a real one.
+```
+
+Start the app against the copy with fake keys for payments, email and video, so any call to them
+fails. Review every image, and delete the branch afterwards.
