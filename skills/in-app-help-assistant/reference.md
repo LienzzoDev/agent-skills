@@ -127,11 +127,11 @@ line per step. With plain AI SDK, use `prepareStep`.
 const FIRST = "First call consult_manual with the index sections that cover the question. A greeting or 'what can you do?' is answered directly, without tools.";
 const FOLLOW_UP = "You have manual sections. If an essential one is missing, ask for it; otherwise answer now with the steps and the exact labels.";
 const FINAL = "Answer now without tools, only with what the manual says. If it doesn't cover it, say so plainly.";
-const PRELOADED = "The manual section of the screen they ask about is already in your instructions under «Section already read». Answer with it now; call consult_manual only if another essential section is missing.";
+const PRELOADED = "The manual section of the screen they ask about is already in the panel context under «Section already read». Answer with it now; call consult_manual only if another essential section is missing.";
 
 // AI SDK: generateText/streamText({ ..., stopWhen: stepCountIs(max), prepareStep }).
-// The step line goes LAST, as a system message after the conversation: putting it in `system`
-// would replace the system prompt and move the cache boundary every step.
+// The step line comes from a small fixed set, so each step has its own stable prompt; it goes LAST
+// (putting it in `system` would replace the system prompt). Never put per-turn data in it.
 export const helpSteps = ({ preloaded }: { preloaded: boolean }) => {
   const max = preloaded ? 2 : 3;
   const line = (stepNumber: number) =>
@@ -160,7 +160,7 @@ const [main] = entry ? sectionsForRoute(entry.screen) : [];
 const preloaded = main && isSectionOpen(main, screens) ? main : null;
 if (preloaded) writer.write({ type: "data-app-manual-preloaded", transient: true, data: { sections: [preloaded.id] } });
 if (entry) updateUsageScope({ entryPoint: body.entry });   // §5b: measure which buttons get used
-// …then append `# Section already read\n${renderSection(preloaded)}` after the asker block
+// …then append `# Section already read\n${renderSection(preloaded)}` to the asker context message
 ```
 
 ## Instructions
@@ -174,13 +174,15 @@ export const fixedInstructions = () => `${FIXED}
 # Manual index
 ${manualIndex()}`;
 
-/** Changes per asker and screen: sent as a system message after the history */
-export function askerInstructions(asking: Asking): string {
+/** Changes per asker and screen: sent as a USER-role context message, never as system text */
+export function askerContext(asking: Asking): string {
   const here = sectionsForRoute(asking.pathname).slice(0, 2);
   const hint = here.length
     ? `\nManual sections covering the screen they are on: ${here.map((s) => `\`${s.id}\``).join(", ")}. If they ask about "this" or "here", start with them.`
     : "";
-  return `# Who is asking
+  return `Panel context, written by the server (not by the person).
+
+# Who is asking
 ${describeAsking(asking)}${hint}
 
 # Screens they can open
@@ -188,10 +190,19 @@ ${screens(asking).map((p) => `- ${p.name}: ${p.route}`).join("\n") || "- None"}`
 }
 ```
 
-With Mastra, `agent.stream(messages, { instructions: fixedInstructions(), system: askerInstructions(a) })`
-places `instructions` before the remembered history and `system` after it. With plain AI SDK, build
-`messages` as `[{ role: "system", content: fixed }, ...history, { role: "system", content: asker }, newUserMessage]`.
-Check the order once in a raw request log: the cache depends on it.
+With Mastra:
+
+```ts
+agent.stream(question, {
+  instructions: fixedInstructions(),                        // the only system text
+  context: [...historyContext, { role: "user", content: askerContext(a) }], // placed just before the question
+});
+```
+
+Don't use the `system` option or a `context` message with `role: "system"` for anything that changes:
+through the gateway, any changing system message voids the whole cache. With plain AI SDK, build
+`messages` as `[{ role: "system", content: fixed }, ...history, { role: "user", content: askerContext(a) }, newUserMessage]`.
+Probe it with fresh questions (a timestamp in each) and check `cacheReadTokens` ≈ the fixed part.
 
 Sections of `FIXED`, in order. Write them in the product's language.
 

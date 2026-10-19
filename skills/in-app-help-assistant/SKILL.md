@@ -120,22 +120,38 @@ Ask the user only what the code can't tell you.
 ## 2. Prompt layout (cache-friendly)
 
 ```
-[FIXED — identical for everyone, goes first so the provider caches it]
-  role and scope · how to answer usage questions · screenshot rules · action rules · data rules · limits
-[Manual index]                        stable between deploys
----------------- conversation history ----------------
-[Who is asking]                       name, role, modules they can and can't see, today's date, current screen
-[Screens they can open]               from the same function that builds their nav menu, byte-stable per permission set
-[Preloaded section]                   only on "Explain this" turns (§4b)
+SYSTEM (the only system text, byte-identical for everyone)
+  [FIXED] role and scope · how to answer usage questions · screenshot rules · action rules · data rules · limits
+  [Manual index]                      stable between deploys
+  [Step line]                         optional, one of a small fixed set (§5)
+USER-ROLE CONTEXT MESSAGE (before the question, labelled as server-provided)
+  [Conversation history summary]      if the runtime injects one
+  [Who is asking]                     name, role, modules they can and can't see, today's date, current screen
+  [Screens they can open]             from the same function that builds their nav menu
+  [Preloaded section]                 only on "Explain this" turns (§4b)
+USER                                  the question
 ```
 
 **Caching is the main cost lever.** Providers cache the longest identical prefix of the prompt,
-so what changes per person or per screen must come after everything that doesn't:
+so what changes per person, per screen or per turn must come after everything that doesn't:
 
-- **Fixed part before the history.** Put the rules and the index in the agent's `instructions`
-  (the system message before the history). Send the per-asker part as a system message after the
-  history. If the asker block sits inside the instructions, the prefix breaks at the asker's name
-  and every turn of every person pays for the whole prompt again.
+- **Nothing variable in a system message.** Through Vercel AI Gateway to OpenAI, *any* system
+  message whose text changes between calls voids the whole cache, the fixed part included, even
+  when it comes after 4,000 identical tokens. Measured in one build:
+  - fixed system + user question: 3,894 of 3,913 tokens read from cache;
+  - fixed system + a second system message that changes + question: 0;
+  - the same changing text as a user message instead: 3,894 again.
+
+  So put the rules and the index in the agent's `instructions` and nothing else in system text.
+  Send who is asking, the preloaded section, injected conversation history and per-turn
+  parameters (the current record, the snapshot, the suggested search query) as a user-role
+  context message just before the question, with a line saying the server wrote it. With Mastra
+  that is the `context` option with `role: "user"`. The `system` option and a `context` with
+  `role: "system"` both void the cache.
+- **Audit every agent, not only the help one.** In that build the runtime's shared "conversation
+  context" message was a system message, so every agent with history had 0% cache in production.
+  Two others mixed fixed rules and per-turn data in one system string. Split those into fixed rules
+  (system) and data (context).
 - **Make the prefix long enough.** OpenAI caches only prompts of 1,024 tokens or more, in
   128-token steps. A short task (a router, a synthesis step) whose fixed guidance is under that
   size never caches. Put all the stable guidance first and the per-turn document last. In one
@@ -146,6 +162,9 @@ so what changes per person or per screen must come after everything that doesn't
   lands on the same cache. Keep providers pinned (§0) for the same reason.
 - **Keep the variable blocks byte-stable.** List screens in a fixed order. Write today's date and
   not the time. Don't add request ids or timestamps to the prompt.
+- **Test it with fresh questions.** Repeating the same question reads the whole prompt from cache
+  and hides a broken prefix. Probe with questions that change on every call (append a timestamp)
+  and compare the cached tokens with the size of the fixed part.
 - **Check it in the log.** Record `cachedInputTokens` per call (§5b). A feature with 0 cached
   tokens on its second turn has a broken prefix.
 
@@ -261,7 +280,7 @@ across screens (for example, restock what is missing).
   which buttons get used.
 - **Preload the section.** The client sends the entry id, never the prompt, and the server looks up
   the button's screen. It finds that screen's main manual section, and only if the asker can open it
-  appends it after the history as if the tool had returned it. It also writes a transient data part
+  appends it to the user-role context message as if the tool had returned it. It also writes a transient data part
   (`data-app-manual-preloaded`) so the panel still shows the "read the manual" step. That turn then
   answers in its first step, with at most one extra section, and has no action tool, because an
   "explain" button never asks to do anything. Without the preloaded section, the first call exists
@@ -457,7 +476,7 @@ the same words.
       and the pinned provider route
 - [ ] Manual loader, keyword index without routes, `consult_manual` tool, coverage test
 - [ ] Sections closed in the tool for screens the asker can't open
-- [ ] Prompt with the fixed part before the history and the asker after it, a cache key, and a prefix over
+- [ ] Prompt with only fixed system text and everything variable in a user-role context message, a cache key, a prefix over
       the provider's caching minimum
 - [ ] "Who is asking" from the real session and permissions
 - [ ] Panel on every screen (top entry, shortcut and command menu), docked, container-query-safe
